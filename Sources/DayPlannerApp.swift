@@ -1,19 +1,22 @@
 //
 //  DayPlannerApp.swift
-//  Распорядок дня + To-Do
+//  Распорядок дня + To-Do  (v1.1)
 //
-//  Требования: Xcode 26+ (или 27 beta), iOS 26.0+ (Liquid Glass).
-//  Установка: создайте проект iOS App (SwiftUI), удалите стандартные
-//  ContentView.swift и <Имя>App.swift, добавьте этот файл.
+//  Требования: Xcode 26+, iOS 26.0+ (Liquid Glass).
+//  Для Напоминаний в Info.plist нужен ключ NSRemindersFullAccessUsageDescription
+//  (в build-ipa.yml он уже добавлен).
 //
 
 import SwiftUI
+import EventKit
 
 // MARK: - Приложение
 
 @main
 struct DayPlannerApp: App {
     @StateObject private var store = Store()
+    @AppStorage("theme") private var theme = 0
+    @AppStorage("accent") private var accent = 0
 
     var body: some Scene {
         WindowGroup {
@@ -21,7 +24,39 @@ struct DayPlannerApp: App {
                 .environmentObject(store)
                 .environment(\.locale, Locale(identifier: "ru_RU"))
                 .environment(\.calendar, Calendar.planner)
+                .environment(\.brand, Palette.color(accent))
+                .tint(Palette.color(accent))
+                .preferredColorScheme(Palette.scheme(theme))
         }
+    }
+}
+
+// MARK: - Тема и акцентный цвет
+
+enum Palette {
+    static let colors: [Color] = [.blue, .indigo, .purple, .pink, .orange, .green, .teal]
+
+    static func color(_ i: Int) -> Color {
+        colors.indices.contains(i) ? colors[i] : Color.blue
+    }
+
+    static func scheme(_ t: Int) -> ColorScheme? {
+        switch t {
+        case 1: return .light
+        case 2: return .dark
+        default: return nil
+        }
+    }
+}
+
+private struct BrandKey: EnvironmentKey {
+    static let defaultValue: Color = .blue
+}
+
+extension EnvironmentValues {
+    var brand: Color {
+        get { self[BrandKey.self] }
+        set { self[BrandKey.self] = newValue }
     }
 }
 
@@ -82,9 +117,14 @@ extension Date {
         cal.date(byAdding: .day, value: n, to: self) ?? self
     }
 
-    /// 7 дней недели (с понедельника), в которую входит дата
+    /// Понедельник недели, в которую входит дата
+    var weekStart: Date {
+        cal.dateInterval(of: .weekOfYear, for: self)?.start ?? startOfDay
+    }
+
+    /// 7 дней недели (с понедельника)
     var weekDays: [Date] {
-        let start = cal.dateInterval(of: .weekOfYear, for: self)?.start ?? self
+        let start = weekStart
         return (0..<7).map { start.addingDays($0) }
     }
 }
@@ -140,6 +180,7 @@ struct ScheduleItem: Identifiable, Codable, Hashable {
     var start: Int          // минуты от полуночи
     var duration: Int       // минуты (0 = без длительности)
     var weekdays: Set<Int>  // Calendar.weekday
+    var reminderID: String?
 
     var end: Int { start + duration }
 }
@@ -149,13 +190,167 @@ struct TodoItem: Identifiable, Codable, Hashable {
     var title: String
     var date: Date
     var isDone = false
+    var reminderID: String?
+}
+
+struct ReminderListInfo: Identifiable {
+    let id: String
+    let title: String
+}
+
+// MARK: - Интеграция с Напоминаниями (EventKit)
+
+final class RemindersService {
+    private let eventStore = EKEventStore()
+    private let defaults = UserDefaults.standard
+
+    var tasksOn: Bool { defaults.bool(forKey: "remTasks") }
+    var routineOn: Bool { defaults.bool(forKey: "remRoutine") }
+    var hasAccess: Bool { EKEventStore.authorizationStatus(for: .reminder) == .fullAccess }
+
+    func requestAccess() async -> Bool {
+        if hasAccess { return true }
+        return (try? await eventStore.requestFullAccessToReminders()) ?? false
+    }
+
+    func allLists() -> [EKCalendar] {
+        guard hasAccess else { return [] }
+        return eventStore.calendars(for: .reminder).filter { $0.allowsContentModifications }
+    }
+
+    /// Ищет список по сохранённому id или названию, иначе создаёт новый
+    private func list(named title: String, idKey: String) -> EKCalendar? {
+        if let id = defaults.string(forKey: idKey), !id.isEmpty,
+           let found = eventStore.calendar(withIdentifier: id) {
+            return found
+        }
+        if let found = eventStore.calendars(for: .reminder)
+            .first(where: { $0.title == title && $0.allowsContentModifications }) {
+            defaults.set(found.calendarIdentifier, forKey: idKey)
+            return found
+        }
+        let created = EKCalendar(for: .reminder, eventStore: eventStore)
+        created.title = title
+        created.source = eventStore.defaultCalendarForNewReminders()?.source ?? eventStore.sources.first
+        do {
+            try eventStore.saveCalendar(created, commit: true)
+            defaults.set(created.calendarIdentifier, forKey: idKey)
+            return created
+        } catch {
+            return nil
+        }
+    }
+
+    private var taskList: EKCalendar? { list(named: "Распорядок дня", idKey: "remListID") }
+    private var routineList: EKCalendar? { list(named: "Расписание", idKey: "remRoutineListID") }
+
+    func reminder(_ id: String?) -> EKReminder? {
+        guard let id, let r = eventStore.calendarItem(withIdentifier: id) as? EKReminder else { return nil }
+        return r
+    }
+
+    func date(of r: EKReminder) -> Date? {
+        guard let comps = r.dueDateComponents, let d = cal.date(from: comps) else { return nil }
+        return d.startOfDay
+    }
+
+    // Задачи
+
+    func fetchTaskIDs() async -> [String] {
+        guard tasksOn, hasAccess, let lst = taskList else { return [] }
+        let predicate = eventStore.predicateForReminders(in: [lst])
+        return await withCheckedContinuation { continuation in
+            eventStore.fetchReminders(matching: predicate) { result in
+                continuation.resume(returning: (result ?? []).map { $0.calendarItemIdentifier })
+            }
+        }
+    }
+
+    func create(title: String, date: Date, done: Bool = false) -> String? {
+        guard tasksOn, hasAccess, let lst = taskList else { return nil }
+        let r = EKReminder(eventStore: eventStore)
+        r.calendar = lst
+        r.title = title
+        r.isCompleted = done
+        r.dueDateComponents = cal.dateComponents([.year, .month, .day], from: date)
+        do {
+            try eventStore.save(r, commit: true)
+            return r.calendarItemIdentifier
+        } catch {
+            return nil
+        }
+    }
+
+    func update(id: String?, title: String? = nil, done: Bool? = nil) {
+        guard tasksOn, let r = reminder(id) else { return }
+        if let title { r.title = title }
+        if let done { r.isCompleted = done }
+        try? eventStore.save(r, commit: true)
+    }
+
+    func remove(id: String?) {
+        guard tasksOn, let r = reminder(id) else { return }
+        try? eventStore.remove(r, commit: true)
+    }
+
+    // Распорядок: повторяющиеся напоминания со звуковым сигналом в момент начала
+
+    func syncRoutine(_ item: ScheduleItem) -> String? {
+        guard routineOn, hasAccess, let lst = routineList else { return nil }
+        let r = reminder(item.reminderID) ?? EKReminder(eventStore: eventStore)
+        r.calendar = lst
+        r.title = item.title
+        r.notes = item.kind.title + (item.duration > 0 ? " · " + durationText(item.duration) : "")
+        r.dueDateComponents = firstDue(for: item)
+
+        r.recurrenceRules?.forEach { r.removeRecurrenceRule($0) }
+        let days = item.weekdays.sorted()
+            .compactMap { EKWeekday(rawValue: $0) }
+            .map { EKRecurrenceDayOfWeek($0) }
+        r.addRecurrenceRule(EKRecurrenceRule(
+            recurrenceWith: .weekly, interval: 1, daysOfTheWeek: days,
+            daysOfTheMonth: nil, monthsOfTheYear: nil, weeksOfTheYear: nil,
+            daysOfTheYear: nil, setPositions: nil, end: nil
+        ))
+
+        r.alarms?.forEach { r.removeAlarm($0) }
+        r.addAlarm(EKAlarm(relativeOffset: 0))
+
+        do {
+            try eventStore.save(r, commit: true)
+            return r.calendarItemIdentifier
+        } catch {
+            return nil
+        }
+    }
+
+    func removeRoutine(_ item: ScheduleItem) {
+        guard let r = reminder(item.reminderID) else { return }
+        try? eventStore.remove(r, commit: true)
+    }
+
+    private func firstDue(for item: ScheduleItem) -> DateComponents {
+        let now = Date()
+        let parts: Set<Calendar.Component> = [.year, .month, .day, .hour, .minute]
+        for i in 0..<8 {
+            let day = now.startOfDay.addingDays(i)
+            guard item.weekdays.contains(day.weekday),
+                  let t = cal.date(bySettingHour: (item.start / 60) % 24, minute: item.start % 60, second: 0, of: day),
+                  t > now else { continue }
+            return cal.dateComponents(parts, from: t)
+        }
+        return cal.dateComponents(parts, from: now)
+    }
 }
 
 // MARK: - Хранилище (JSON в Documents)
 
+@MainActor
 final class Store: ObservableObject {
     @Published private(set) var schedule: [ScheduleItem] = []
     @Published private(set) var todos: [TodoItem] = []
+
+    let reminders = RemindersService()
 
     private struct Snapshot: Codable {
         var schedule: [ScheduleItem]
@@ -182,6 +377,8 @@ final class Store: ObservableObject {
     }
 
     func upsert(_ item: ScheduleItem) {
+        var item = item
+        item.reminderID = reminders.syncRoutine(item)
         if let i = schedule.firstIndex(where: { $0.id == item.id }) {
             schedule[i] = item
         } else {
@@ -194,11 +391,17 @@ final class Store: ObservableObject {
     func remove(_ item: ScheduleItem, fromWeekday wd: Int) {
         guard let i = schedule.firstIndex(where: { $0.id == item.id }) else { return }
         schedule[i].weekdays.remove(wd)
-        if schedule[i].weekdays.isEmpty { schedule.remove(at: i) }
+        if schedule[i].weekdays.isEmpty {
+            reminders.removeRoutine(schedule[i])
+            schedule.remove(at: i)
+        } else {
+            schedule[i].reminderID = reminders.syncRoutine(schedule[i])
+        }
         save()
     }
 
     func removeEverywhere(_ item: ScheduleItem) {
+        reminders.removeRoutine(item)
         schedule.removeAll { $0.id == item.id }
         save()
     }
@@ -210,19 +413,113 @@ final class Store: ObservableObject {
     }
 
     func addTodo(_ title: String, on date: Date) {
-        todos.append(TodoItem(title: title, date: date.startOfDay))
+        let day = date.startOfDay
+        let rid = reminders.create(title: title, date: day)
+        todos.append(TodoItem(title: title, date: day, reminderID: rid))
         save()
     }
 
     func toggle(_ todo: TodoItem) {
         guard let i = todos.firstIndex(where: { $0.id == todo.id }) else { return }
         todos[i].isDone.toggle()
+        reminders.update(id: todos[i].reminderID, done: todos[i].isDone)
         save()
     }
 
     func delete(_ todo: TodoItem) {
+        reminders.remove(id: todo.reminderID)
         todos.removeAll { $0.id == todo.id }
         save()
+    }
+
+    func clearCompleted() {
+        for t in todos where t.isDone { reminders.remove(id: t.reminderID) }
+        todos.removeAll { $0.isDone }
+        save()
+    }
+
+    func resetAll() {
+        for t in todos { reminders.remove(id: t.reminderID) }
+        for s in schedule { reminders.removeRoutine(s) }
+        todos = []
+        schedule = Self.sample()
+        for i in schedule.indices { schedule[i].reminderID = reminders.syncRoutine(schedule[i]) }
+        save()
+    }
+
+    // Синхронизация с Напоминаниями
+
+    func enableTaskSync() async -> Bool {
+        guard await reminders.requestAccess() else { return false }
+        for i in todos.indices where todos[i].reminderID == nil {
+            todos[i].reminderID = reminders.create(
+                title: todos[i].title, date: todos[i].date, done: todos[i].isDone
+            )
+        }
+        save()
+        await pullReminders()
+        return true
+    }
+
+    func enableRoutineSync() async -> Bool {
+        guard await reminders.requestAccess() else { return false }
+        for i in schedule.indices { schedule[i].reminderID = reminders.syncRoutine(schedule[i]) }
+        save()
+        return true
+    }
+
+    func disableRoutineSync() {
+        for i in schedule.indices {
+            reminders.removeRoutine(schedule[i])
+            schedule[i].reminderID = nil
+        }
+        save()
+    }
+
+    /// Подтягивает изменения из Напоминаний (новые, изменённые, удалённые задачи)
+    func pullReminders() async {
+        guard reminders.tasksOn, reminders.hasAccess else { return }
+        let ids = await reminders.fetchTaskIDs()
+
+        var list = todos
+        var changed = false
+
+        for id in ids where !list.contains(where: { $0.reminderID == id }) {
+            guard let r = reminders.reminder(id) else { continue }
+            list.append(TodoItem(
+                title: r.title ?? "",
+                date: reminders.date(of: r) ?? Date().startOfDay,
+                isDone: r.isCompleted,
+                reminderID: id
+            ))
+            changed = true
+        }
+
+        var i = 0
+        while i < list.count {
+            guard let id = list[i].reminderID else { i += 1; continue }
+            if let r = reminders.reminder(id), r.refresh() {
+                let title = r.title ?? list[i].title
+                let day = reminders.date(of: r) ?? list[i].date
+                if list[i].title != title
+                    || list[i].isDone != r.isCompleted
+                    || !cal.isDate(list[i].date, inSameDayAs: day) {
+                    list[i].title = title
+                    list[i].isDone = r.isCompleted
+                    list[i].date = day
+                    changed = true
+                }
+                i += 1
+            } else {
+                list.remove(at: i)   // удалено в Напоминаниях
+                changed = true
+            }
+        }
+
+        if changed {
+            todos = list
+            save()
+        }
     }
 
     // Сохранение
@@ -252,9 +549,53 @@ final class Store: ObservableObject {
     }
 }
 
+// MARK: - Фон (сетка-градиент, чтобы стекло было видно)
+
+struct AppBackground: View {
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.brand) private var brand
+
+    var body: some View {
+        let dark = scheme == .dark
+        let base = dark
+            ? Color(red: 0.04, green: 0.05, blue: 0.09)
+            : Color(red: 0.95, green: 0.96, blue: 0.99)
+        let k: Float = dark ? 0.45 : 0.6
+        let a = brand.mix(with: base, by: k)
+        let b = Color.purple.mix(with: base, by: k + 0.1)
+        let c = Color.orange.mix(with: base, by: k + 0.15)
+
+        MeshGradient(
+            width: 3, height: 3,
+            points: [
+                [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+                [0.0, 0.5], [0.6, 0.4], [1.0, 0.5],
+                [0.0, 1.0], [0.5, 1.0], [1.0, 1.0]
+            ],
+            colors: [a, base, b, base, a, base, c, base, a]
+        )
+        .ignoresSafeArea()
+    }
+}
+
+extension View {
+    func appBackground() -> some View {
+        background { AppBackground() }
+    }
+
+    /// Строка списка без фона и разделителей (под стеклянную карточку)
+    func glassRow() -> some View {
+        listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 4, trailing: 14))
+    }
+}
+
 // MARK: - Корневой экран: 3 вкладки со свайпом
 
 struct RootView: View {
+    @EnvironmentObject private var store: Store
+    @Environment(\.scenePhase) private var phase
     @State private var tab = 1   // по умолчанию — центральная
 
     var body: some View {
@@ -270,13 +611,21 @@ struct RootView: View {
             GlassTabBar(selection: $tab)
         }
         .sensoryFeedback(.selection, trigger: tab)
+        .task { await store.pullReminders() }
+        .onChange(of: phase) { _, new in
+            if new == .active { Task { await store.pullReminders() } }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .EKEventStoreChanged)) { _ in
+            Task { await store.pullReminders() }
+        }
     }
 }
 
-/// Нижний переключатель в стиле Liquid Glass
+/// Нижний переключатель: стеклянная капсула, выбранная вкладка — «жидкая» стеклянная таблетка
 struct GlassTabBar: View {
     @Binding var selection: Int
     @Namespace private var ns
+    @Environment(\.brand) private var brand
 
     private let items: [(title: String, icon: String)] = [
         ("Календарь", "calendar"),
@@ -285,45 +634,79 @@ struct GlassTabBar: View {
     ]
 
     var body: some View {
-        HStack(spacing: 0) {
-            ForEach(items.indices, id: \.self) { i in
-                let selected = selection == i
-                Button {
-                    withAnimation(.snappy) { selection = i }
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: items[i].icon)
-                            .font(.system(size: 20, weight: .semibold))
-                            .symbolVariant(selected ? .fill : .none)
-                        Text(items[i].title)
-                            .font(.caption2.weight(.semibold))
-                    }
-                    .foregroundStyle(selected ? Color.accentColor : Color.primary.opacity(0.7))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-                    .background {
-                        if selected {
-                            Capsule()
-                                .fill(Color.accentColor.opacity(0.16))
-                                .matchedGeometryEffect(id: "pill", in: ns)
+        GlassEffectContainer(spacing: 12) {
+            HStack(spacing: 0) {
+                ForEach(items.indices, id: \.self) { i in
+                    let selected = selection == i
+                    Button {
+                        withAnimation(.bouncy(duration: 0.45)) { selection = i }
+                    } label: {
+                        VStack(spacing: 3) {
+                            Image(systemName: items[i].icon)
+                                .font(.system(size: 20, weight: .semibold))
+                                .symbolVariant(selected ? .fill : .none)
+                            Text(items[i].title)
+                                .font(.caption2.weight(.semibold))
                         }
+                        .foregroundStyle(selected ? brand : Color.primary.opacity(0.7))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background {
+                            if selected {
+                                Color.clear
+                                    .glassEffect(.regular.tint(brand.opacity(0.28)).interactive(), in: .capsule)
+                                    .glassEffectID("selected", in: ns)
+                            }
+                        }
+                        .contentShape(Capsule())
                     }
-                    .contentShape(Capsule())
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
+            .padding(5)
+            .glassEffect(.regular, in: .capsule)
         }
-        .padding(5)
-        .glassEffect(.regular.interactive(), in: .capsule)
         .padding(.horizontal, 20)
         .padding(.bottom, 4)
     }
 }
 
-// MARK: - Полоса выбора дня недели (общая)
+// MARK: - Кнопка настроек
+
+struct SettingsButton: View {
+    @State private var show = false
+
+    var body: some View {
+        Button { show = true } label: {
+            Label("Настройки", systemImage: "gearshape")
+        }
+        .sheet(isPresented: $show) { SettingsView() }
+    }
+}
+
+// MARK: - Полоса недели с «липким» пролистыванием
 
 struct WeekStrip: View {
     @Binding var date: Date
+    @Environment(\.brand) private var brand
+    @State private var weekIndex: Int?
+
+    private static let base = Date().weekStart
+    private static let range = -156...156   // ±3 года
+
+    init(date: Binding<Date>) {
+        _date = date
+        _weekIndex = State(initialValue: Self.index(of: date.wrappedValue))
+    }
+
+    private static func index(of d: Date) -> Int {
+        let days = cal.dateComponents([.day], from: base, to: d.weekStart).day ?? 0
+        return Int((Double(days) / 7).rounded())
+    }
+
+    private static func start(of index: Int) -> Date {
+        base.addingDays(index * 7)
+    }
 
     var body: some View {
         let days = date.weekDays
@@ -347,24 +730,56 @@ struct WeekStrip: View {
                     .buttonBorderShape(.circle)
                     .controlSize(.small)
             }
+            .padding(.horizontal, 12)
 
-            GlassEffectContainer(spacing: 6) {
-                HStack(spacing: 6) {
-                    ForEach(days, id: \.self) { day in
-                        chip(for: day)
+            ScrollView(.horizontal) {
+                LazyHStack(spacing: 0) {
+                    ForEach(Self.range, id: \.self) { i in
+                        weekRow(i)
+                            .containerRelativeFrame(.horizontal)
                     }
+                }
+                .scrollTargetLayout()
+            }
+            .scrollTargetBehavior(.paging)
+            .scrollPosition(id: $weekIndex, anchor: .leading)
+            .scrollIndicators(.hidden)
+            .scrollClipDisabled()
+        }
+        .padding(.vertical, 8)
+        .sensoryFeedback(.selection, trigger: weekIndex)
+        .onChange(of: weekIndex) { _, new in
+            // неделю пролистали — выбираем тот же день недели в новой неделе
+            guard let new, new != Self.index(of: date) else { return }
+            let offset = (date.weekday - cal.firstWeekday + 7) % 7
+            date = Self.start(of: new).addingDays(offset)
+        }
+        .onChange(of: date) { _, new in
+            // дату сменили (стрелки, «Сегодня») — докручиваем полосу до нужной недели
+            let i = Self.index(of: new)
+            if weekIndex != i {
+                withAnimation(.snappy) { weekIndex = i }
+            }
+        }
+    }
+
+    private func weekRow(_ i: Int) -> some View {
+        let start = Self.start(of: i)
+        return GlassEffectContainer(spacing: 6) {
+            HStack(spacing: 6) {
+                ForEach(0..<7, id: \.self) { k in
+                    chip(for: start.addingDays(k))
                 }
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
     }
 
     private func chip(for day: Date) -> some View {
         let selected = cal.isDate(day, inSameDayAs: date)
         let isToday = cal.isDateInToday(day)
         let glass: Glass = selected
-            ? Glass.regular.tint(Color.accentColor).interactive()
+            ? Glass.regular.tint(brand).interactive()
             : Glass.regular.interactive()
 
         return Button {
@@ -376,7 +791,7 @@ struct WeekStrip: View {
                 Text("\(cal.component(.day, from: day))")
                     .font(.title3.weight(.semibold).monospacedDigit())
                 Circle()
-                    .fill(isToday ? (selected ? Color.white : Color.accentColor) : Color.clear)
+                    .fill(isToday ? (selected ? Color.white : brand) : Color.clear)
                     .frame(width: 4, height: 4)
             }
             .foregroundStyle(selected ? Color.white : Color.primary)
@@ -417,9 +832,10 @@ struct ScheduleTab: View {
                         Button {
                             editor = EditorTarget(item: item, weekday: date.weekday)
                         } label: {
-                            ScheduleRow(item: item)
+                            ScheduleRow(item: item, card: true)
                         }
                         .buttonStyle(.plain)
+                        .glassRow()
                         .swipeActions(edge: .trailing) {
                             Button(role: .destructive) {
                                 store.remove(item, fromWeekday: date.weekday)
@@ -430,7 +846,9 @@ struct ScheduleTab: View {
                     }
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .contentMargins(.bottom, 100, for: .scrollContent)
+                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .overlay {
                     if items.isEmpty {
                         ContentUnavailableView(
@@ -441,11 +859,13 @@ struct ScheduleTab: View {
                     }
                 }
             }
+            .appBackground()
             .navigationTitle(Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    SettingsButton()
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
@@ -467,19 +887,34 @@ struct ScheduleTab: View {
 
 struct ScheduleRow: View {
     let item: ScheduleItem
+    var card = false
 
     var body: some View {
-        HStack(spacing: 14) {
+        if card {
+            content
+                .padding(12)
+                .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
+        HStack(spacing: 12) {
             VStack(alignment: .trailing, spacing: 2) {
                 Text(Fmt.time(item.start))
                     .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .fixedSize()
                 if item.duration > 0 {
                     Text(Fmt.time(item.end))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
                 }
             }
-            .frame(width: 48, alignment: .trailing)
+            .frame(minWidth: 50, alignment: .trailing)
 
             Image(systemName: item.kind.icon)
                 .font(.system(size: 16, weight: .semibold))
@@ -490,21 +925,23 @@ struct ScheduleRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
                     .font(.body.weight(.medium))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
 
-    private var subtitle: String {
-        item.duration > 0
-            ? "\(item.kind.title) · \(durationText(item.duration))"
-            : item.kind.title
+    private var subtitle: String? {
+        if item.duration > 0 {
+            return "\(item.kind.title) · \(durationText(item.duration))"
+        }
+        return item.title == item.kind.title ? nil : item.kind.title
     }
 }
 
@@ -513,6 +950,7 @@ struct ScheduleRow: View {
 struct ScheduleEditor: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.brand) private var brand
 
     private let original: ScheduleItem?
     @State private var title: String
@@ -580,7 +1018,7 @@ struct ScheduleEditor: View {
                                     .padding(.vertical, 10)
                                     .foregroundStyle(on ? Color.white : Color.primary)
                                     .background(
-                                        on ? Color.accentColor : Color.secondary.opacity(0.15),
+                                        on ? brand : Color.secondary.opacity(0.15),
                                         in: .rect(cornerRadius: 10)
                                     )
                             }
@@ -670,24 +1108,25 @@ struct TodoTab: View {
 
                 List {
                     if !todos.isEmpty {
-                        Section {
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("Выполнено")
-                                        .font(.subheadline.weight(.semibold))
-                                    Spacer()
-                                    Text("\(done) из \(todos.count)")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                                ProgressView(value: Double(done), total: Double(todos.count))
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Выполнено")
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                Text("\(done) из \(todos.count)")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
                             }
-                            .padding(.vertical, 4)
+                            ProgressView(value: Double(done), total: Double(todos.count))
                         }
+                        .padding(14)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+                        .glassRow()
                     }
 
                     ForEach(todos) { todo in
-                        TodoRow(todo: todo)
+                        TodoRow(todo: todo, card: true)
+                            .glassRow()
                             .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) {
                                     withAnimation { store.delete(todo) }
@@ -697,7 +1136,10 @@ struct TodoTab: View {
                             }
                     }
                 }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
                 .contentMargins(.bottom, 100, for: .scrollContent)
+                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .overlay {
                     if todos.isEmpty {
                         ContentUnavailableView(
@@ -708,11 +1150,13 @@ struct TodoTab: View {
                     }
                 }
             }
+            .appBackground()
             .navigationTitle(cal.isDateInToday(date) ? "Сегодня" : Fmt.string(date, "EEEE").capFirst)
             .navigationSubtitle(Fmt.string(date, "d MMMM"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    SettingsButton()
                     Button("Сегодня") {
                         withAnimation(.snappy) { date = Date().startOfDay }
                     }
@@ -733,28 +1177,40 @@ struct TodoTab: View {
 struct TodoRow: View {
     @EnvironmentObject private var store: Store
     let todo: TodoItem
+    var card = false
 
     var body: some View {
         Button {
             withAnimation(.snappy) { store.toggle(todo) }
         } label: {
-            HStack(spacing: 12) {
-                Image(systemName: todo.isDone ? "checkmark.circle.fill" : "circle")
-                    .font(.title2)
-                    .foregroundStyle(todo.isDone ? Color.green : Color.secondary)
-                    .contentTransition(.symbolEffect(.replace))
-                Text(todo.title)
-                    .strikethrough(todo.isDone)
-                    .foregroundStyle(todo.isDone ? .secondary : .primary)
-                Spacer(minLength: 0)
+            if card {
+                content
+                    .padding(12)
+                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 22))
+            } else {
+                content
             }
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .sensoryFeedback(.selection, trigger: todo.isDone)
     }
+
+    private var content: some View {
+        HStack(spacing: 12) {
+            Image(systemName: todo.isDone ? "checkmark.circle.fill" : "circle")
+                .font(.title2)
+                .foregroundStyle(todo.isDone ? Color.green : Color.secondary)
+                .contentTransition(.symbolEffect(.replace))
+            Text(todo.title)
+                .strikethrough(todo.isDone)
+                .foregroundStyle(todo.isDone ? .secondary : .primary)
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+    }
 }
 
+/// Окно добавления задачи: по «Добавить» (или Return) задача сохраняется и окно закрывается
 struct AddTodoSheet: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
@@ -789,8 +1245,8 @@ struct AddTodoSheet: View {
             .navigationTitle(Fmt.string(date, "EEEE, d MMMM").capFirst)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Готово") { dismiss() }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { dismiss() }
                 }
             }
         }
@@ -801,8 +1257,7 @@ struct AddTodoSheet: View {
     private func add() {
         guard !trimmed.isEmpty else { return }
         store.addTodo(trimmed, on: date)
-        text = ""
-        focused = true
+        dismiss()
     }
 }
 
@@ -831,13 +1286,16 @@ struct CalendarTab: View {
                     .padding(.top, 8)
                 }
                 .contentMargins(.bottom, 100, for: .scrollContent)
+                .scrollEdgeEffectStyle(.soft, for: .bottom)
                 .onAppear { scrollToCurrent(proxy) }
                 .onChange(of: year) { _, _ in scrollToCurrent(proxy) }
             }
+            .appBackground()
             .navigationTitle(String(year))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    SettingsButton()
                     Button("Сегодня") {
                         year = cal.component(.year, from: Date())
                     }
@@ -861,6 +1319,7 @@ struct CalendarTab: View {
 }
 
 struct MonthView: View {
+    @Environment(\.brand) private var brand
     let year: Int
     let month: Int
     let onSelect: (Date) -> Void
@@ -881,7 +1340,7 @@ struct MonthView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(Fmt.string(first, "LLLL").capFirst)
                 .font(.title2.bold())
-                .foregroundStyle(isCurrentMonth ? Color.accentColor : Color.primary)
+                .foregroundStyle(isCurrentMonth ? brand : Color.primary)
                 .padding(.horizontal, 4)
 
             HStack(spacing: 2) {
@@ -908,6 +1367,7 @@ struct MonthView: View {
 
 struct DayCell: View {
     @EnvironmentObject private var store: Store
+    @Environment(\.brand) private var brand
     let date: Date
     let action: () -> Void
 
@@ -922,7 +1382,7 @@ struct DayCell: View {
                     .foregroundStyle(isToday ? Color.white : Color.primary)
                     .frame(width: 22, height: 22)
                     .background {
-                        if isToday { Circle().fill(Color.accentColor) }
+                        if isToday { Circle().fill(brand) }
                     }
 
                 VStack(alignment: .leading, spacing: 1) {
@@ -935,7 +1395,7 @@ struct DayCell: View {
                             .padding(.horizontal, 2)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(
-                                Color.accentColor.opacity(t.isDone ? 0.07 : 0.18),
+                                brand.opacity(t.isDone ? 0.07 : 0.2),
                                 in: .rect(cornerRadius: 3)
                             )
                     }
@@ -957,7 +1417,7 @@ struct DayCell: View {
             .overlay {
                 if isToday {
                     RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color.accentColor, lineWidth: 1.5)
+                        .strokeBorder(brand, lineWidth: 1.5)
                 }
             }
             .contentShape(Rectangle())
@@ -970,6 +1430,7 @@ struct DayCell: View {
 struct DayDetailSheet: View {
     @EnvironmentObject private var store: Store
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.brand) private var brand
 
     let date: Date
     @State private var newTitle = ""
@@ -995,7 +1456,7 @@ struct DayDetailSheet: View {
                     HStack(spacing: 12) {
                         Image(systemName: "plus.circle.fill")
                             .font(.title2)
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(brand)
                         TextField("Новое дело", text: $newTitle)
                             .submitLabel(.done)
                             .onSubmit(add)
@@ -1029,3 +1490,154 @@ struct DayDetailSheet: View {
     }
 }
 
+// MARK: - Настройки
+
+struct SettingsView: View {
+    @EnvironmentObject private var store: Store
+    @Environment(\.dismiss) private var dismiss
+
+    @AppStorage("theme") private var theme = 0
+    @AppStorage("accent") private var accent = 0
+    @AppStorage("remTasks") private var remTasks = false
+    @AppStorage("remRoutine") private var remRoutine = false
+    @AppStorage("remListID") private var remListID = ""
+
+    @State private var lists: [ReminderListInfo] = []
+    @State private var showDenied = false
+    @State private var showReset = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Внешний вид") {
+                    Picker("Тема", selection: $theme) {
+                        Text("Как в системе").tag(0)
+                        Text("Светлая").tag(1)
+                        Text("Тёмная").tag(2)
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Цвет акцента")
+                        HStack(spacing: 12) {
+                            ForEach(Palette.colors.indices, id: \.self) { i in
+                                Button { accent = i } label: {
+                                    Circle()
+                                        .fill(Palette.colors[i].gradient)
+                                        .frame(width: 30, height: 30)
+                                        .overlay {
+                                            if accent == i {
+                                                Image(systemName: "checkmark")
+                                                    .font(.caption.bold())
+                                                    .foregroundStyle(.white)
+                                            }
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section {
+                    Toggle("Задачи в Напоминаниях", isOn: $remTasks)
+
+                    if remTasks {
+                        Picker("Список", selection: $remListID) {
+                            if remListID.isEmpty {
+                                Text("Распорядок дня").tag("")
+                            }
+                            ForEach(lists) { l in
+                                Text(l.title).tag(l.id)
+                            }
+                        }
+
+                        Button {
+                            Task { await store.pullReminders() }
+                        } label: {
+                            Label("Синхронизировать сейчас", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+
+                    Toggle("Напоминать о распорядке", isOn: $remRoutine)
+                } header: {
+                    Text("Напоминания")
+                } footer: {
+                    Text("Задачи синхронизируются в обе стороны через список в приложении «Напоминания». Пункты распорядка создаются там повторяющимися напоминаниями с сигналом в момент начала.")
+                }
+
+                Section("Данные") {
+                    Button("Удалить выполненные задачи") { store.clearCompleted() }
+                    Button("Сбросить всё", role: .destructive) { showReset = true }
+                }
+
+                Section {
+                    LabeledContent("Версия", value: "1.1")
+                }
+            }
+            .navigationTitle("Настройки")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Готово") { dismiss() }
+                }
+            }
+            .onAppear(perform: loadLists)
+            .onChange(of: remTasks) { _, on in
+                Task { await tasksChanged(on) }
+            }
+            .onChange(of: remRoutine) { _, on in
+                Task { await routineChanged(on) }
+            }
+            .onChange(of: remListID) { _, _ in
+                Task { await store.pullReminders() }
+            }
+            .alert("Нет доступа к Напоминаниям", isPresented: $showDenied) {
+                Button("Открыть настройки") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("Отмена", role: .cancel) {}
+            } message: {
+                Text("Разрешите доступ: Настройки → Приложения → Распорядок → Напоминания.")
+            }
+            .confirmationDialog(
+                "Удалить все задачи и вернуть распорядок по умолчанию?",
+                isPresented: $showReset,
+                titleVisibility: .visible
+            ) {
+                Button("Сбросить", role: .destructive) { store.resetAll() }
+            }
+        }
+    }
+
+    private func loadLists() {
+        lists = store.reminders.allLists().map {
+            ReminderListInfo(id: $0.calendarIdentifier, title: $0.title)
+        }
+    }
+
+    private func tasksChanged(_ on: Bool) async {
+        guard on else { return }
+        if await store.enableTaskSync() {
+            loadLists()
+        } else {
+            remTasks = false
+            showDenied = true
+        }
+    }
+
+    private func routineChanged(_ on: Bool) async {
+        if on {
+            if await store.enableRoutineSync() {
+                loadLists()
+            } else {
+                remRoutine = false
+                showDenied = true
+            }
+        } else {
+            store.disableRoutineSync()
+        }
+    }
+}
